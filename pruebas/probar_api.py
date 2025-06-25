@@ -19,7 +19,7 @@ class SupersetClient:
         self.cookies = {}
         self.total_requests = 0  # 总请求数
         self.error_requests = 0  # 错误请求数
-        self.ignore_error_tables = set([])  # 忽略错误的表名
+        self.ignore_error_tables = set(['FCC'])  # 忽略错误的表名
 
     def error(self, message):
         print(f"Error: {message}", file=sys.stderr)
@@ -242,6 +242,54 @@ class SupersetClient:
                 ) for query in queries)
             )
 
+    async def extress_dashboard_api(self, batch_size=10):
+        dashboards = self.list_dashboards_return()  # 返回 dashboard 列表而不是打印
+
+        queries = []
+        for dashboard in dashboards:
+            title = dashboard.get("dashboard_title")
+            for i in range(batch_size):  # 批量构造重复请求
+                queries.append({
+                    'url': f"{self.superset_url}/api/v1/dashboard",
+                    'params': {
+                        'q': prison.dumps({
+                            "filters": [
+                                {"col": "dashboard_title", "opr": "eq", "value": title}
+                            ]
+                        })
+                    }
+                })
+
+        async with aiohttp.ClientSession() as session:
+            ret = await asyncio.gather(
+                *(self.asyncRequest(
+                    session=session,
+                    method='GET',
+                    url=query.get('url'),
+                    params=query.get('params')
+                ) for query in queries)
+            )
+
+    def list_dashboards_return(self):
+        query = {
+            "columns": ["dashboard_title", "id"],
+            "page": 0,
+            "page_size": 1000
+        }
+        encoded_query = requests.utils.quote(json.dumps(query))
+        url = f"{self.superset_url}/api/v1/dashboard/?q={encoded_query}"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.access_token}",
+            "X-CSRFToken": self.csrf_token
+        }
+        response = requests.get(url, headers=headers, cookies=self.cookies)
+        if response.status_code != 200:
+            self.error(f"Failed getting dashboards: {response.text}")
+
+        result = response.json().get('result')
+        return result
+
 
 async def main(argv):
     client = SupersetClient(superset_host, superset_username, superset_password)
@@ -256,11 +304,14 @@ async def main(argv):
     client.me() # <-- requiere cookie del login
     print('ME:', client.user_me)
 
-    client.get_guest_token()  # <-- NO requiere cookie del login
-    print('guess_token:', client.guess_token)
+    # client.get_guest_token()  # <-- NO requiere cookie del login
+    # print('guess_token:', client.guess_token)
 
     # dataset = client.get_dataset_by_name(name = 'ficheros')
     # print('dataset:', dataset)
+    await client.extress_dashboard_api(batch_size=10)
+    client.print_error_rate()
+
 
     await client.extress_dataset_api()
 
