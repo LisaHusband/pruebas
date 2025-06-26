@@ -1,14 +1,18 @@
 import sys
+import time
 import requests
 import json
 import prison
 import aiohttp
 import asyncio
 import re
+from tqdm import tqdm
 from auth import *
+from asyncio import Lock
 
 class SupersetClient:
-    def __init__(self, superset_url, username, password):
+    def __init__(self, superset_url, username, password, test_api_type):
+        self.lock = Lock()  # 🔒用于保护共享数据
         self.superset_url = superset_url
         self.username = username
         self.password = password
@@ -19,10 +23,12 @@ class SupersetClient:
         self.cookies = {}
         self.total_requests = 0  # 总请求数
         self.error_requests = 0  # 错误请求数
-        self.ignore_error_tables = set(['FCC'])  # 忽略错误的表名
+        self.ignore_error_tables = set(['World Bank'])  # 忽略错误的表名
+        self.error_tables = []
+        self.test_api_type = test_api_type
 
     def error(self, message):
-        print(f"Error: {message}", file=sys.stderr)
+        tqdm.write(f"Error: {message}", file=sys.stderr)
         sys.exit(77)
 
     def get_access_token(self):
@@ -76,11 +82,12 @@ class SupersetClient:
                 "Authorization": f"Bearer {self.access_token}"
             }
 
-            request_table_name = re.search(r'value:\'?([0-9a-zA-Z:_\-\.]+)\'?', params.get('q')).group(1)
-            print(request_table_name)
+            request_table_name = re.search(r"value:?['\"]?([\w\s:\-\.]+)['\"]?", params.get('q')).group(1)
+            tqdm.write(f"request for {request_table_name}")
 
             async with session.request(method, url, headers=headers, cookies=self.cookies, params=params) as response:
-                self.total_requests += 1
+                async with self.lock:
+                    self.total_requests += 1
                 if response.status != 200:
                     text = await response.text()
                     self.error(f"Failed getting dataset: {text}")
@@ -88,32 +95,45 @@ class SupersetClient:
                 result = result_json.get('result')
 
                 if (len(result) != 1):
-                    print(f"Error!!! {len(result)} items")
-                    self.error_requests += 1
+                    tqdm.write(f"Error!!! {len(result)} items")
+                    async with self.lock:
+                        self.error_requests += 1
 
-                response_table_name = result[0].get('table_name')
-                print(f"response for {request_table_name}")
+                if self.test_api_type == 'dashboard':
+                    response_table_name = result[0].get('dashboard_title')
+                elif self.test_api_type == 'dataset':
+                    response_table_name = result[0].get('table_name')
+                else:
+                    tqdm.write(f"Error!!! unknown test_api_type {self.test_api_type}")
+
+                tqdm.write(f"response for {request_table_name}")
 
                 if (request_table_name != response_table_name):
                     if request_table_name not in self.ignore_error_tables:
-                        print(f"Error!!! {request_table_name} != {response_table_name}")
-                        # print(result[0])
-                        print(result_json)
-                        self.error_requests += 1
+                        tqdm.write(f"Error!!! {request_table_name} != {response_table_name}")
+                        # tqdm.write(result[0])
+                        # tqdm.write(str(result_json))
+                        async with self.lock:
+                            self.error_requests += 1
+                            self.error_tables.append(f"Error!!! {request_table_name} != {response_table_name}")
                 return result
 
         except Exception as e:
-            print(e)
-            print("Unable to get url {} due to {}.".format(url, e.__class__))
+            tqdm.write(f"Error: {e}", file=sys.stderr)
+            tqdm.write("Unable to get url {} due to {}.".format(url, e.__class__))
             self.error_requests += 1
     
 
-    def print_error_rate(self):
+    def _error_rate(self):
         if self.total_requests == 0:
-            print("No requests made yet.")
+            tqdm.write("No requests made yet.")
         else:
             rate = self.error_requests / self.total_requests
-            print(f"Error rate: {self.error_requests}/{self.total_requests} = {rate:.2%}")
+        
+        return rate
+            # tqdm.write("-" * 80)
+            # tqdm.write(f"Tested API {self.test_api_type}, ingnore error tables: {self.ignore_error_tables}")
+            # tqdm.write(f"Error rate: {self.error_requests}/{self.total_requests} = {rate:.2%}")
 
             
     def get_guest_token(self):
@@ -166,7 +186,7 @@ class SupersetClient:
         for dashboard in result:
             title = dashboard['dashboard_title']
             dashboard_id = dashboard['id']
-            print(f"Dashboard: {title} - id: {dashboard_id}")
+            tqdm.write(f"Dashboard: {title} - id: {dashboard_id}")
 
     def me(self):
         url = f"{self.superset_url}/api/v1/me"
@@ -222,7 +242,7 @@ class SupersetClient:
             table_name = dataset.get("table_name")
             for i in range(1, batch_size):
                 queries.append({
-                    'url': f"{self.superset_url}/api/v1/dataset",
+                    'url': f"{self.superset_url}/api/v1/dataset/",
                     'params': {
                         'q': prison.dumps({
                             "filters": [
@@ -288,11 +308,34 @@ class SupersetClient:
             self.error(f"Failed getting dashboards: {response.text}")
 
         result = response.json().get('result')
+        # tqdm.write(result)
         return result
 
 
+def _summary(error_count, total_count, start_time, end_time, rate_of_round, error_tables):
+    tqdm.write("-" * 80)
+    tqdm.write(f"Total time: {(end_time - start_time):.2f} seconds")
+    tqdm.write("-" * 80)
+    if total_count == 0:
+        tqdm.write("No requests made yet, Test Failed")
+        return 
+        
+    tqdm.write("-" * 80)
+    tqdm.write(f"Total requests: {total_count}, \
+                Total error rate: {error_count}/{total_count} = {error_count/total_count:.2%}")
+    tqdm.write("-" * 80)
+    for i in range(len(rate_of_round)):
+        tqdm.write(f"Rate of round {i+1}: {rate_of_round[i]:.2%}")
+    mean_rate = sum(rate_of_round) / len(rate_of_round)
+    tqdm.write(f"Mean rate of round: {mean_rate:.2%}")
+    tqdm.write("-" * 80)
+    for i in range(len(error_tables)):
+        tqdm.write(f"Error table {i+1}: {error_tables[i]}")
+    tqdm.write("-" * 80)
+
+
 async def main(argv):
-    client = SupersetClient(superset_host, superset_username, superset_password)
+    client = SupersetClient(superset_host, superset_username, superset_password, test_api_type=test_api_type)
 
     client.get_access_token()
     client.get_csrf_token()
@@ -309,15 +352,47 @@ async def main(argv):
 
     # dataset = client.get_dataset_by_name(name = 'ficheros')
     # print('dataset:', dataset)
-    await client.extress_dashboard_api(batch_size=10)
-    client.print_error_rate()
+
+    Total_requests = 0
+    Error_requests = 0
+    Rate_of_round = []
+    Error_tables = []
+    start_time = time.time()
+
+    # 压测轮数
+    for i in tqdm(range(1, 11), desc="Processing"):
+        tqdm.write(f"Round {i}")
+        
+        if test_api_type == 'dashboard':
+            # 压测dashboard api
+            await client.extress_dashboard_api(batch_size=10)
+        elif test_api_type == 'dataset':
+            # 压测dataset api
+            await client.extress_dataset_api(batch_size=10)
+        else:
+            tqdm.write(f"Error!!! unknown test_api_type {test_api_type}")
+
+        Rate_of_round.append(client._error_rate())
+        Total_requests += client.total_requests
+        Error_requests += client.error_requests
+        Error_tables.append(client.error_tables)
+        
+        client.total_requests = 0
+        client.error_requests = 0
+        client.error_tables = []
 
 
-    await client.extress_dataset_api()
-
-    # 统计响应错误率（可以选择忽略某个表）
-    client.print_error_rate()
+        tqdm.write(f"Total requests: {client.total_requests}, \
+                    Total error: {client.error_requests}")
+    
+    end_time = time.time()
+    _summary(Error_requests, Total_requests, start_time, end_time, Rate_of_round, Error_tables)
+    
 
 
 if __name__ == "__main__":
-    asyncio.run( main(sys.argv[1:]) )
+    try:
+        asyncio.run( main(sys.argv[1:]) )
+    except Exception as e:
+        tqdm.write(f"Error: {e}", file=sys.stderr)
+        sys.exit(77)

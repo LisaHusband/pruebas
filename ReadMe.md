@@ -1,5 +1,9 @@
 # Apache Superset dataset api 测试工具
 
+## 使用方式
+* auth.py 配置文件（目前支持的测试api类型：dataset or dashboard）
+* probar.py 主文件
+
 ## 关联issue：[#33857](https://github.com/apache/superset/issues/33828)
 ### 🐞 Bug Fix Log: Filter Parameter Contamination in Concurrent Requests
 
